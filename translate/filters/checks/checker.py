@@ -21,7 +21,9 @@
 
 from __future__ import annotations
 
+import gettext
 from collections.abc import Callable, Mapping
+from functools import lru_cache
 from typing import TYPE_CHECKING, TypedDict
 
 from translate.filters import helpers, prefilters
@@ -57,6 +59,16 @@ class CheckFailureInfo(TypedDict):
 
 #: Result of :meth:`UnitChecker.run_filters`, keyed by check/filter name.
 CheckFailures = Mapping[str, str | CheckFailureInfo]
+
+
+@lru_cache
+def first_plural_form_is_singular(pluralequation: str) -> bool:
+    """Returns whether the first plural form is used for ``n == 1`` only."""
+    try:
+        plural = gettext.c2py(pluralequation)
+    except ValueError:
+        return True
+    return all(plural(n) != 0 for n in range(1000) if n != 1)
 
 
 def cache_results(f: FunctionType) -> FunctionType:
@@ -331,23 +343,43 @@ class TranslationChecker(UnitChecker):
         if self.hasplural:
             filtermessages = []
             filterresult = True
-            sources = (
-                unit.source.strings
-                if isinstance(unit.source, multistring)
-                else [unit.source]
-            )
+            sources = [
+                data.normalize(source) or ""
+                for source in (
+                    unit.source.strings
+                    if isinstance(unit.source, multistring)
+                    else [unit.source]
+                )
+            ]
+            singular = sources[0]
+            plural = sources[-1]
+            # The first form follows the singular source. Where the language
+            # also uses it for other numbers (e.g. Russian 21, 31, ... or
+            # French 0), it may follow the plural source as well, as it has to
+            # contain the count then.
+            firstsources = [singular]
+            lang = self.config.lang
+            if (
+                plural != singular
+                and lang.nplurals > 0
+                and not first_plural_form_is_singular(lang.pluralequation)
+            ):
+                firstsources.append(plural)
 
             for index, pluralform in enumerate(unit.target.strings):
-                # The first target form pairs with the singular source and
-                # all following forms pair with the plural source.
-                source = sources[index] if index < len(sources) else sources[-1]
-                str1 = data.normalize(source) or ""
-                try:
-                    if not test(str1, str(pluralform)):
-                        filterresult = False
-                except FilterFailure as e:
+                # The other forms have to follow the plural source.
+                formsources = firstsources if index == 0 else [plural]
+                formmessages = []
+                for source in formsources:
+                    try:
+                        if test(source, str(pluralform)):
+                            break
+                    except FilterFailure as e:
+                        if not formmessages:
+                            formmessages = e.messages
+                else:
                     filterresult = False
-                    filtermessages.extend(e.messages)
+                    filtermessages.extend(formmessages)
 
             if not filterresult and filtermessages:
                 raise FilterFailure(filtermessages)
